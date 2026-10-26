@@ -2,6 +2,7 @@
 the LLM's prose is only ever used for claims, never as the evidence itself."""
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 from .sandbox import clip
@@ -11,7 +12,12 @@ if TYPE_CHECKING:  # pragma: no cover
 
 
 def _fence(text: str, lang: str = "") -> str:
-    return f"```{lang}\n{text.rstrip()}\n```"
+    cleaned = text.rstrip()
+    ticks = 3
+    for m in re.finditer(r"`+", cleaned):
+        ticks = max(ticks, len(m.group(0)) + 1)
+    f = "`" * ticks
+    return f"{f}{lang}\n{cleaned}\n{f}"
 
 
 def render_report(dbg: "Debugger", out: "Outcome") -> str:
@@ -21,8 +27,11 @@ def render_report(dbg: "Debugger", out: "Outcome") -> str:
           f"- **Confidence:** {out.confidence}",
           f"- **Model:** `{s['model']}` | **sandbox:** `{s['sandbox']}` | **mode:** {'baseline (no hypothesis stage)' if cfg.baseline else 'hypothesis-driven'}",
           f"- **Cost:** {s['llm_calls']} LLM calls, {s['seconds']}s, {s['iterations']} iteration(s), {s['hypotheses']} hypothesis(es)",
-          f"- **Full trace:** `{out.trace_path}` (every claim below cites an event id `#n`)", "",
-          "## Bug report", "", cfg.bug_report.strip(), ""]
+          f"- **Full trace:** `{out.trace_path}` (every claim below cites an event id `#n`)", ""]
+    
+    # Blockquote the bug report so markdown headings inside it don't inject fake sections (BUG-083)
+    quoted_bug = "\n".join(f"> {line}" if line.strip() else ">" for line in cfg.bug_report.strip().splitlines())
+    L += ["## Bug report", "", quoted_bug, ""]
 
     L += ["## Reproduction", ""]
     if dbg.repro:
@@ -41,8 +50,10 @@ def render_report(dbg: "Debugger", out: "Outcome") -> str:
     if dbg.ledger:
         L += ["| id | iter | status | claim | evidence |", "|---|---|---|---|---|"]
         for h in dbg.ledger:
-            ev = ", ".join(f"#{e}" for e in h.evidence_events) or "-"
-            L.append(f"| {h.id} | {h.iteration} | **{h.status}** | {h.claim.replace('|', '/')[:140]} | {ev} |")
+            ev_str = ", ".join(f"#{e}" for e in h.evidence_events) or "-"
+            # Replace newlines with space and escape pipes (BUG-082, BUG-094)
+            clean_claim = h.claim.replace("\r", " ").replace("\n", " ").replace("|", r"\|")[:140]
+            L.append(f"| {h.id} | {h.iteration} | **{h.status}** | {clean_claim} | {ev_str} |")
         L.append("")
         for h in dbg.ledger:
             if not h.evidence_events:

@@ -37,7 +37,10 @@ def test_symlink_escape_blocked(tmp_path):
     repo = tmp_path / "r"
     repo.mkdir()
     (repo / "m.py").write_text("x=1\n")
-    os.symlink("/etc/hostname", repo / "link.txt")
+    try:
+        os.symlink("/etc/hostname", repo / "link.txt")
+    except OSError:
+        pytest.skip("symlinks not supported/permitted on this platform")
     with Sandbox(repo, timeout=10) as sb:
         tools = Tools(sb, Trace(tmp_path / "t.jsonl"))
         assert not tools.call("read_file", {"path": "link.txt"}).ok

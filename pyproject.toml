@@ -1,7 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "autodebug"
 version = "0.1.0"
 description = "Autonomous, evidence-producing debugging agent on a local LLM (no Docker)"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Doshab Hussain"}
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Debuggers",
+    "Topic :: Software Development :: Testing",
+]
 requires-python = ">=3.10"
 dependencies = []          # standard library only; the *target* repo needs pytest
 
@@ -10,6 +30,9 @@ dev = ["pytest"]
 
 [project.scripts]
 autodebug = "autodebug.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["autodebug*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

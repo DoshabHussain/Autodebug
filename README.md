@@ -25,6 +25,16 @@ python -m autodebug REPO --bug "..." --base-url http://localhost:8080/v1 --model
 Target repos need `pytest` available to the interpreter (use `--python /path/to/venv/bin/python` to run the
 target's tests with its own environment). Add `--apply` to copy the verified fix into the repo.
 
+## Configuration
+
+AutoDebug can be configured via CLI flags or environment variables:
+
+| Environment Variable | CLI Flag | Default | Description |
+|---|---|---|---|
+| `AUTODEBUG_MODEL` | `--model` | `qwen2.5-coder:7b` | Default LLM model name |
+| `AUTODEBUG_BASE_URL` | `--base-url` | `http://localhost:11434/v1` | OpenAI-compatible endpoint URL |
+| `AUTODEBUG_API_KEY` | `--api-key` | None | Optional Bearer API key for LLM servers |
+
 ## How it works
 
 ```

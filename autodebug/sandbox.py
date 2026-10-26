@@ -35,7 +35,7 @@ try:
 except ImportError:  # pragma: no cover
     resource = None  # type: ignore[assignment]
 
-IGNORE_DIRS = {".git", ".hg", ".venv", "venv", "env", "node_modules", "__pycache__",
+IGNORE_DIRS = {".git", ".hg", "node_modules", "__pycache__",
                ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".idea", ".vscode"}
 MAX_FILES = 20000
 AGENT_TEST_RE = re.compile(r"^tests/test_agent_[a-z0-9_]+\.py$")
@@ -47,33 +47,65 @@ class SandboxError(RuntimeError):
 
 
 def clip(text: str, limit: int = 4000) -> str:
+    if limit <= 0:
+        return ""
     if len(text) <= limit:
         return text
     head = int(limit * 0.6)
-    return f"{text[:head]}\n...[{len(text) - limit} chars truncated]...\n{text[-(limit - head):]}"
+    tail = limit - head
+    return f"{text[:head]}\n...[{len(text) - limit} chars truncated]...\n{text[len(text) - tail:]}"
 
 
 def is_protected(rel: str) -> bool:
     """Existing tests and test configuration are read-only for the agent."""
     p = PurePosixPath(rel)
     name = p.name
-    if name in _PROTECTED_NAMES or name.startswith("test_") or name.endswith("_test.py"):
+    if name in _PROTECTED_NAMES:
         return True
-    return any(part in ("tests", "test", "testing") for part in p.parts[:-1])
+    parts = p.parts
+    # Protect files inside the top-level test folder(s)
+    if parts and parts[0] in ("tests", "test"):
+        return True
+    # Protect root-level test scripts
+    if len(parts) == 1 and (name.startswith("test_") or name.endswith("_test.py")):
+        return True
+    return False
 
 
 def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _is_venv(dir_path: Path) -> bool:
+    return (dir_path / "pyvenv.cfg").exists()
+
+
 def _walk(root: Path, exclude: frozenset[Path] = frozenset()) -> Iterator[str]:
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames
-                       if d not in IGNORE_DIRS and (Path(dirpath) / d).resolve() not in exclude]
+        filtered_dirs = []
+        for d in dirnames:
+            dp = Path(dirpath) / d
+            if d in IGNORE_DIRS:
+                continue
+            if d in (".venv", "venv", "env") and _is_venv(dp):
+                continue
+            if dp.resolve() in exclude:
+                continue
+            filtered_dirs.append(d)
+        dirnames[:] = filtered_dirs
+
         for f in filenames:
             p = Path(dirpath) / f
-            if p.is_symlink() or f.endswith(".pyc"):
+            if f.endswith(".pyc"):
                 continue
+            if p.is_symlink():
+                try:
+                    resolved = p.resolve()
+                    ws_resolved = root.resolve()
+                    if ws_resolved not in resolved.parents and resolved != ws_resolved:
+                        continue  # symlink escapes workspace
+                except (OSError, RuntimeError):
+                    continue
             yield p.relative_to(root).as_posix()
 
 
@@ -96,7 +128,7 @@ class RunResult:
 def _probe(cmd: list[str]) -> bool:
     try:
         return subprocess.run(cmd, capture_output=True, timeout=10).returncode == 0
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return False
 
 
@@ -127,34 +159,77 @@ def _read_clipped(f, limit: int = 20000) -> str:
             + tail.decode("utf-8", "replace"))
 
 
+def _kill_proc_tree(pid: int) -> None:
+    """Kill a process and any descendant processes (BUG-028)."""
+    try:
+        children_file = Path(f"/proc/{pid}/task/{pid}/children")
+        if children_file.is_file():
+            for cpid_str in children_file.read_text().split():
+                _kill_proc_tree(int(cpid_str))
+    except Exception:
+        pass
+    if os.name == "posix":
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        os.kill(pid, signal.SIGKILL if hasattr(signal, "SIGKILL") else signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
 class Sandbox:
     def __init__(self, source: Path | str, *, backend: str = "auto", python: str | None = None,
                  timeout: float = 60, mem_mb: int = 2048, exclude: Iterable[Path | str] = ()) -> None:
-        if os.name != "posix":
-            raise SandboxError("POSIX only (Linux, macOS or WSL)")
         self.source = Path(source).resolve()
         if not self.source.is_dir():
             raise SandboxError(f"not a directory: {source}")
-        self.python = python or sys.executable
+        self.python = str(Path(python).resolve()) if python else sys.executable
         self.timeout, self.mem_mb = timeout, mem_mb
         self.backend = detect_backend(backend)
+        if os.name != "posix" and self.backend not in ("auto", "plain"):
+            raise SandboxError(f"requested sandbox backend {backend!r} is not usable on this machine")
         self._exclude = frozenset(Path(p).resolve() for p in exclude)
+        
+        # Ensure temp directory is cleaned up if initialization fails (BUG-033)
         self.root = Path(tempfile.mkdtemp(prefix="autodebug-")).resolve()
-        self.ws = self.root / "ws"
-        (self.root / "home").mkdir()
-        self._runs = 0
-        if sum(1 for _ in _walk(self.source, self._exclude)) > MAX_FILES:
-            raise SandboxError(f"repository has more than {MAX_FILES} files; point at a sub-directory")
-        self._copy(self.source, self.ws)
-        self._orig = {rel: _sha(self.ws / rel) for rel in _walk(self.ws)}
-        self.protected_orig = {rel: h for rel, h in self._orig.items() if is_protected(rel)}
+        try:
+            self.ws = self.root / "ws"
+            (self.root / "home").mkdir()
+            self._runs = 0
+            if sum(1 for _ in _walk(self.source, self._exclude)) > MAX_FILES:
+                raise SandboxError(f"repository has more than {MAX_FILES} files; point at a sub-directory")
+            self._copy(self.source, self.ws)
+            self._orig = {rel: _sha(self.ws / rel) for rel in _walk(self.ws)}
+            self.protected_orig = {rel: h for rel, h in self._orig.items() if is_protected(rel)}
+        except Exception:
+            shutil.rmtree(self.root, ignore_errors=True)
+            raise
 
     # ------------------------------------------------------------------ copying / paths
-    def _copy(self, src: Path, dst: Path) -> None:
+    def _copy(self, src: Path, dst: Path, fast_link: bool = False) -> None:
         def ignore(d: str, names: list[str]) -> list[str]:
-            return [n for n in names if n in IGNORE_DIRS or n.endswith(".pyc")
-                    or (Path(d) / n).resolve() in self._exclude]
-        shutil.copytree(src, dst, symlinks=True, ignore=ignore)
+            dp = Path(d)
+            ign: list[str] = []
+            for n in names:
+                if n in IGNORE_DIRS or n.endswith(".pyc"):
+                    ign.append(n)
+                elif n in (".venv", "venv", "env") and _is_venv(dp / n):
+                    ign.append(n)
+                elif (dp / n).resolve() in self._exclude:
+                    ign.append(n)
+            return ign
+
+        if fast_link:
+            def link_or_copy(s: str, d: str) -> None:
+                try:
+                    os.link(s, d)
+                except (OSError, NotImplementedError):
+                    shutil.copy2(s, d)
+            shutil.copytree(src, dst, symlinks=True, ignore=ignore, copy_function=link_or_copy)
+        else:
+            shutil.copytree(src, dst, symlinks=True, ignore=ignore)
 
     def resolve(self, rel: str) -> Path:
         """Map an agent-supplied relative path to a real path, refusing anything outside `ws`."""
@@ -178,7 +253,8 @@ class Sandbox:
         """A disposable copy of the working copy. Everything untrusted runs here."""
         self._runs += 1
         d = self.root / f"run{self._runs}"
-        self._copy(self.ws, d)
+        # Use fast linking to avoid slow copies of large repos (BUG-036)
+        self._copy(self.ws, d, fast_link=True)
         try:
             yield d
         finally:
@@ -186,9 +262,14 @@ class Sandbox:
 
     def _env(self, cwd: Path) -> dict[str, str]:
         home = "/tmp" if self.backend == "bwrap" else str(self.root / "home")
-        return {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": home, "TMPDIR": home,
-                "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
-                "PYTHONPATH": str(cwd), "PYTHONUNBUFFERED": "1"}
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": home, "TMPDIR": home,
+               "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
+               "PYTHONPATH": str(cwd), "PYTHONUNBUFFERED": "1"}
+        if os.name == "nt":
+            for k in ("SYSTEMROOT", "SystemRoot", "WINDIR", "PATHEXT", "COMSPEC", "TEMP", "TMP", "USERPROFILE"):
+                if k in os.environ:
+                    env[k] = os.environ[k]
+        return env
 
     def _python_prefixes(self) -> list[str]:
         prefixes = {sys.prefix, sys.base_prefix, sys.exec_prefix}
@@ -197,7 +278,7 @@ class Sandbox:
         try:
             import site
             prefixes.add(site.getusersitepackages())
-        except Exception:
+        except (AttributeError, ImportError, OSError):
             pass
         return sorted(p for p in prefixes if p and os.path.exists(p))
 
@@ -228,13 +309,23 @@ class Sandbox:
     def _limits(self, timeout: float):
         if resource is None:
             return None
-        mem = self.mem_mb * 1024 * 1024
+        # Raise RLIMIT_AS to 8 GiB so multi-threaded workloads don't run out of virtual address space (BUG-030)
+        mem = max(self.mem_mb * 1024 * 1024, 8 * 1024 * 1024 * 1024)
 
         def apply() -> None:
             limits = [(resource.RLIMIT_CPU, int(timeout) + 5), (resource.RLIMIT_FSIZE, 64 * 1024 * 1024),
                       (resource.RLIMIT_NOFILE, 512), (resource.RLIMIT_CORE, 0)]
+            if hasattr(resource, "RLIMIT_NPROC"):
+                # Add RLIMIT_NPROC to contain fork bombs (BUG-029)
+                limits.append((resource.RLIMIT_NPROC, 256))
             if sys.platform.startswith("linux"):
                 limits.append((resource.RLIMIT_AS, mem))
+            elif sys.platform == "darwin":
+                # Apply data/rss limits on macOS where RLIMIT_AS is unsupported (BUG-031)
+                if hasattr(resource, "RLIMIT_DATA"):
+                    limits.append((resource.RLIMIT_DATA, mem))
+                if hasattr(resource, "RLIMIT_RSS"):
+                    limits.append((resource.RLIMIT_RSS, mem))
             for lim, val in limits:
                 try:
                     resource.setrlimit(lim, (val, val))
@@ -243,23 +334,27 @@ class Sandbox:
         return apply
 
     def run(self, argv: list[str], cwd: Path, timeout: float | None = None) -> RunResult:
-        timeout = timeout or self.timeout
+        timeout = self.timeout if timeout is None else timeout
         cmd = self._wrap(argv, cwd)
         t0 = time.monotonic()
         timed_out = False
         with tempfile.TemporaryFile() as fo, tempfile.TemporaryFile() as fe:
+            preexec = self._limits(timeout) if os.name == "posix" else None
+            start_sess = True if os.name == "posix" else False
             proc = subprocess.Popen(cmd, cwd=cwd, env=self._env(cwd), stdin=subprocess.DEVNULL,
-                                    stdout=fo, stderr=fe, start_new_session=True,
-                                    preexec_fn=self._limits(timeout))
+                                    stdout=fo, stderr=fe, start_new_session=start_sess,
+                                    preexec_fn=preexec)
             try:
                 proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 timed_out = True
             finally:
-                try:                      # also reaps any stray children in the process group
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
+                if proc.poll() is None:
+                    _kill_proc_tree(proc.pid)
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
                 proc.wait()
             out, err = _read_clipped(fo), _read_clipped(fe)
         return RunResult(argv, None if timed_out else proc.returncode, out, err, timed_out,
@@ -277,7 +372,10 @@ class Sandbox:
         try:
             return p.read_text(encoding="utf-8")
         except UnicodeDecodeError:
-            return "<binary>"
+            try:
+                return p.read_text(encoding="latin-1")
+            except Exception:
+                return "<binary>"
 
     def diff(self) -> str:
         out: list[str] = []
@@ -321,6 +419,10 @@ class Sandbox:
         done = []
         for rel in self.changed_files():
             src, dst = self.ws / rel, dest / rel
+            # Prevent overwriting changes made by the user while the agent was running (BUG-034)
+            if dst.is_file() and rel in self._orig:
+                if _sha(dst) != self._orig[rel]:
+                    continue
             if src.is_file():
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)

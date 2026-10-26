@@ -27,7 +27,7 @@ TERMINAL = {State.DONE, State.ABSTAINED, State.BUDGET_EXHAUSTED}
 
 _S = State
 _ALLOWED: dict[State, set[State]] = {
-    _S.INITIAL: {_S.REPRODUCING},
+    _S.INITIAL: {_S.REPRODUCING, _S.ABSTAINED},
     _S.REPRODUCING: {_S.INVESTIGATING, _S.ABSTAINED},
     _S.INVESTIGATING: {_S.HYPOTHESIZING, _S.PATCHING, _S.ABSTAINED},   # PATCHING directly = baseline mode
     _S.HYPOTHESIZING: {_S.HYPOTHESIZING, _S.EXPERIMENTING, _S.PATCHING, _S.ABSTAINED},  # PATCHING: baseline mode only
@@ -106,12 +106,12 @@ class Trace:
         self.state = State.INITIAL.value
 
     def emit(self, kind: str, **data: Any) -> int:
-        rec = {"id": len(self.records) + 1, "t": round(time.time(), 3),
-               "state": self.state, "kind": kind, "data": data}
+        rec: dict[str, Any] = {"id": len(self.records) + 1, "t": round(time.time(), 3),
+                               "state": self.state, "kind": kind, "data": data}
         self.records.append(rec)
         self._fh.write(json.dumps(rec, default=str) + "\n")
         self._fh.flush()
-        return rec["id"]
+        return int(rec["id"])
 
     def get(self, event_id: int) -> dict[str, Any] | None:
         return self.records[event_id - 1] if 0 < event_id <= len(self.records) else None
