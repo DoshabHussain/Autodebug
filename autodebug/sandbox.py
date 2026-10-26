@@ -209,7 +209,7 @@ class Sandbox:
             raise
 
     # ------------------------------------------------------------------ copying / paths
-    def _copy(self, src: Path, dst: Path, fast_link: bool = False) -> None:
+    def _copy(self, src: Path, dst: Path) -> None:
         def ignore(d: str, names: list[str]) -> list[str]:
             dp = Path(d)
             ign: list[str] = []
@@ -222,15 +222,7 @@ class Sandbox:
                     ign.append(n)
             return ign
 
-        if fast_link:
-            def link_or_copy(s: str, d: str) -> None:
-                try:
-                    os.link(s, d)
-                except (OSError, NotImplementedError):
-                    shutil.copy2(s, d)
-            shutil.copytree(src, dst, symlinks=True, ignore=ignore, copy_function=link_or_copy)
-        else:
-            shutil.copytree(src, dst, symlinks=True, ignore=ignore)
+        shutil.copytree(src, dst, symlinks=True, ignore=ignore)
 
     def resolve(self, rel: str) -> Path:
         """Map an agent-supplied relative path to a real path, refusing anything outside `ws`."""
@@ -254,8 +246,7 @@ class Sandbox:
         """A disposable copy of the working copy. Everything untrusted runs here."""
         self._runs += 1
         d = self.root / f"run{self._runs}"
-        # Use fast linking to avoid slow copies of large repos (BUG-036)
-        self._copy(self.ws, d, fast_link=True)
+        self._copy(self.ws, d)
         try:
             yield d
         finally:
