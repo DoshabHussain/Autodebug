@@ -170,11 +170,12 @@ def _kill_proc_tree(pid: int) -> None:
         pass
     if os.name == "posix":
         try:
-            os.killpg(pid, signal.SIGKILL)
+            os.killpg(pid, signal.SIGKILL)  # type: ignore[attr-defined]
         except (ProcessLookupError, PermissionError, OSError):
             pass
     try:
-        os.kill(pid, signal.SIGKILL if hasattr(signal, "SIGKILL") else signal.SIGTERM)
+        sig = signal.SIGKILL if hasattr(signal, "SIGKILL") else signal.SIGTERM  # type: ignore[attr-defined]
+        os.kill(pid, sig)
     except (ProcessLookupError, PermissionError, OSError):
         pass
 
@@ -313,22 +314,22 @@ class Sandbox:
         mem = max(self.mem_mb * 1024 * 1024, 8 * 1024 * 1024 * 1024)
 
         def apply() -> None:
-            limits = [(resource.RLIMIT_CPU, int(timeout) + 5), (resource.RLIMIT_FSIZE, 64 * 1024 * 1024),
-                      (resource.RLIMIT_NOFILE, 512), (resource.RLIMIT_CORE, 0)]
+            limits = [(resource.RLIMIT_CPU, int(timeout) + 5), (resource.RLIMIT_FSIZE, 64 * 1024 * 1024),  # type: ignore[attr-defined]
+                      (resource.RLIMIT_NOFILE, 512), (resource.RLIMIT_CORE, 0)]  # type: ignore[attr-defined]
             if hasattr(resource, "RLIMIT_NPROC"):
                 # Add RLIMIT_NPROC to contain fork bombs (BUG-029)
-                limits.append((resource.RLIMIT_NPROC, 256))
+                limits.append((resource.RLIMIT_NPROC, 256))  # type: ignore[attr-defined]
             if sys.platform.startswith("linux"):
-                limits.append((resource.RLIMIT_AS, mem))
+                limits.append((resource.RLIMIT_AS, mem))  # type: ignore[attr-defined]
             elif sys.platform == "darwin":
                 # Apply data/rss limits on macOS where RLIMIT_AS is unsupported (BUG-031)
                 if hasattr(resource, "RLIMIT_DATA"):
-                    limits.append((resource.RLIMIT_DATA, mem))
+                    limits.append((resource.RLIMIT_DATA, mem))  # type: ignore[attr-defined]
                 if hasattr(resource, "RLIMIT_RSS"):
-                    limits.append((resource.RLIMIT_RSS, mem))
+                    limits.append((resource.RLIMIT_RSS, mem))  # type: ignore[attr-defined]
             for lim, val in limits:
                 try:
-                    resource.setrlimit(lim, (val, val))
+                    resource.setrlimit(lim, (val, val))  # type: ignore[attr-defined]
                 except (ValueError, OSError):
                     pass
         return apply
@@ -343,7 +344,7 @@ class Sandbox:
             start_sess = True if os.name == "posix" else False
             proc = subprocess.Popen(cmd, cwd=cwd, env=self._env(cwd), stdin=subprocess.DEVNULL,
                                     stdout=fo, stderr=fe, start_new_session=start_sess,
-                                    preexec_fn=preexec)
+                                    preexec_fn=preexec)  # noqa: PLW1509
             try:
                 proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
